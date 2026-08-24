@@ -879,3 +879,237 @@ static void ggml_mul_mat_q6_K_q8_1_cuda(
         <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
   }
 }
+
+// ========================= I-quant dense MMQ launchers =========================
+// Adapted from vLLM PR #36226 and llama.cpp's GGUF CUDA kernels.
+
+// ========================= IQ3_S =========================
+
+#if defined(USE_ROCM)
+#define MMQ_X_IQ3_S 64
+#define MMQ_Y_IQ3_S 128
+#define NWARPS_IQ3_S 8
+#else
+#define MMQ_X_IQ3_S 4
+#define MMQ_Y_IQ3_S 32
+#define NWARPS_IQ3_S 4
+#endif
+
+template <typename scalar_t, bool need_check>
+static __global__ void
+#if defined(USE_ROCM)
+__launch_bounds__(WARP_SIZE_GGUF* NWARPS_IQ3_S, 2)
+#endif
+    mul_mat_iq3_s(
+        const void* __restrict__ vx,
+        const void* __restrict__ vy,
+        scalar_t* __restrict__ dst,
+        const int ncols_x,
+        const int nrows_x,
+        const int ncols_y,
+        const int nrows_y,
+        const int nrows_dst) {
+  const int mmq_x = MMQ_X_IQ3_S;
+  const int mmq_y = MMQ_Y_IQ3_S;
+  const int nwarps = NWARPS_IQ3_S;
+
+  mul_mat_q<
+      scalar_t,
+      QK_K,
+      QR_IQ3_S_MMQ,
+      QI_IQ3_S_MMQ,
+      true,
+      block_iq3_s,
+      mmq_x,
+      mmq_y,
+      nwarps,
+      allocate_tiles_iq3_s<mmq_y>,
+      load_tiles_iq3_s<mmq_y, nwarps, need_check>,
+      VDR_IQ3_S_Q8_1_MMQ,
+      vec_dot_iq3_s_q8_1_mul_mat>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+
+template <typename scalar_t>
+static void ggml_mul_mat_iq3_s_q8_1_cuda(
+    const void* vx,
+    const void* vy,
+    scalar_t* dst,
+    const int ncols_x,
+    const int nrows_x,
+    const int ncols_y,
+    const int nrows_y,
+    const int nrows_dst,
+    cudaStream_t stream) {
+  int mmq_x = MMQ_X_IQ3_S;
+  int mmq_y = MMQ_Y_IQ3_S;
+  int nwarps = NWARPS_IQ3_S;
+
+  const int block_num_x = (nrows_x + mmq_y - 1) / mmq_y;
+  const int block_num_y = (ncols_y + mmq_x - 1) / mmq_x;
+  const dim3 block_nums(block_num_x, block_num_y, 1);
+  const dim3 block_dims(WARP_SIZE_GGUF, nwarps, 1);
+
+  if (nrows_x % mmq_y == 0) {
+    const bool need_check = false;
+    mul_mat_iq3_s<scalar_t, need_check>
+        <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+  } else {
+    const bool need_check = true;
+    mul_mat_iq3_s<scalar_t, need_check>
+        <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+  }
+}
+
+// ========================= IQ3_XXS =========================
+
+#if defined(USE_ROCM)
+#define MMQ_X_IQ3_XXS 64
+#define MMQ_Y_IQ3_XXS 128
+#define NWARPS_IQ3_XXS 8
+#else
+#define MMQ_X_IQ3_XXS 4
+#define MMQ_Y_IQ3_XXS 32
+#define NWARPS_IQ3_XXS 4
+#endif
+
+template <typename scalar_t, bool need_check>
+static __global__ void
+#if defined(USE_ROCM)
+__launch_bounds__(WARP_SIZE_GGUF* NWARPS_IQ3_XXS, 2)
+#endif
+    mul_mat_iq3_xxs(
+        const void* __restrict__ vx,
+        const void* __restrict__ vy,
+        scalar_t* __restrict__ dst,
+        const int ncols_x,
+        const int nrows_x,
+        const int ncols_y,
+        const int nrows_y,
+        const int nrows_dst) {
+  const int mmq_x = MMQ_X_IQ3_XXS;
+  const int mmq_y = MMQ_Y_IQ3_XXS;
+  const int nwarps = NWARPS_IQ3_XXS;
+
+  mul_mat_q<
+      scalar_t,
+      QK_K,
+      QR_IQ3_XXS_MMQ,
+      QI_IQ3_XXS_MMQ,
+      true,
+      block_iq3_xxs,
+      mmq_x,
+      mmq_y,
+      nwarps,
+      allocate_tiles_iq3_xxs<mmq_y>,
+      load_tiles_iq3_xxs<mmq_y, nwarps, need_check>,
+      VDR_IQ3_XXS_Q8_1_MMQ,
+      vec_dot_iq3_xxs_q8_1_mul_mat>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+
+template <typename scalar_t>
+static void ggml_mul_mat_iq3_xxs_q8_1_cuda(
+    const void* vx,
+    const void* vy,
+    scalar_t* dst,
+    const int ncols_x,
+    const int nrows_x,
+    const int ncols_y,
+    const int nrows_y,
+    const int nrows_dst,
+    cudaStream_t stream) {
+  int mmq_x = MMQ_X_IQ3_XXS;
+  int mmq_y = MMQ_Y_IQ3_XXS;
+  int nwarps = NWARPS_IQ3_XXS;
+
+  const int block_num_x = (nrows_x + mmq_y - 1) / mmq_y;
+  const int block_num_y = (ncols_y + mmq_x - 1) / mmq_x;
+  const dim3 block_nums(block_num_x, block_num_y, 1);
+  const dim3 block_dims(WARP_SIZE_GGUF, nwarps, 1);
+
+  if (nrows_x % mmq_y == 0) {
+    const bool need_check = false;
+    mul_mat_iq3_xxs<scalar_t, need_check>
+        <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+  } else {
+    const bool need_check = true;
+    mul_mat_iq3_xxs<scalar_t, need_check>
+        <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+  }
+}
+
+// ========================= IQ2_XS =========================
+
+#if defined(USE_ROCM)
+#define MMQ_X_IQ2_XS 64
+#define MMQ_Y_IQ2_XS 128
+#define NWARPS_IQ2_XS 8
+#else
+#define MMQ_X_IQ2_XS 4
+#define MMQ_Y_IQ2_XS 32
+#define NWARPS_IQ2_XS 4
+#endif
+
+template <typename scalar_t, bool need_check>
+static __global__ void
+#if defined(USE_ROCM)
+__launch_bounds__(WARP_SIZE_GGUF* NWARPS_IQ2_XS, 2)
+#endif
+    mul_mat_iq2_xs(
+        const void* __restrict__ vx,
+        const void* __restrict__ vy,
+        scalar_t* __restrict__ dst,
+        const int ncols_x,
+        const int nrows_x,
+        const int ncols_y,
+        const int nrows_y,
+        const int nrows_dst) {
+  const int mmq_x = MMQ_X_IQ2_XS;
+  const int mmq_y = MMQ_Y_IQ2_XS;
+  const int nwarps = NWARPS_IQ2_XS;
+
+  mul_mat_q<
+      scalar_t,
+      QK_K,
+      QR_IQ2_XS_MMQ,
+      QI_IQ2_XS_MMQ,
+      true,
+      block_iq2_xs,
+      mmq_x,
+      mmq_y,
+      nwarps,
+      allocate_tiles_iq2_xs<mmq_y>,
+      load_tiles_iq2_xs<mmq_y, nwarps, need_check>,
+      VDR_IQ2_XS_Q8_1_MMQ,
+      vec_dot_iq2_xs_q8_1_mul_mat>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+
+template <typename scalar_t>
+static void ggml_mul_mat_iq2_xs_q8_1_cuda(
+    const void* vx,
+    const void* vy,
+    scalar_t* dst,
+    const int ncols_x,
+    const int nrows_x,
+    const int ncols_y,
+    const int nrows_y,
+    const int nrows_dst,
+    cudaStream_t stream) {
+  int mmq_x = MMQ_X_IQ2_XS;
+  int mmq_y = MMQ_Y_IQ2_XS;
+  int nwarps = NWARPS_IQ2_XS;
+
+  const int block_num_x = (nrows_x + mmq_y - 1) / mmq_y;
+  const int block_num_y = (ncols_y + mmq_x - 1) / mmq_x;
+  const dim3 block_nums(block_num_x, block_num_y, 1);
+  const dim3 block_dims(WARP_SIZE_GGUF, nwarps, 1);
+
+  if (nrows_x % mmq_y == 0) {
+    const bool need_check = false;
+    mul_mat_iq2_xs<scalar_t, need_check>
+        <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+  } else {
+    const bool need_check = true;
+    mul_mat_iq2_xs<scalar_t, need_check>
+        <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+  }
+}

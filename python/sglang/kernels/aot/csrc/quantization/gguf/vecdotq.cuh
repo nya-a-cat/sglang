@@ -2035,3 +2035,416 @@ vec_dot_iq4_xs_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__
   return d * (sumi1 + sumi2);
 #endif
 }
+
+// ========================= I-quant MMQ tile loaders and dot products =========================
+// Adapted from vLLM PR #36226 and llama.cpp's GGUF CUDA kernels.
+
+// ========================= IQ3_S MMQ =========================
+// IQ3_S: QK_K=256, qs[64], qh[8], signs[32], scales[4], d(half).
+// Custom QR=2, QI=32 for MMQ (1 block/warp, like IQ4_XS_MMQ).
+// tile_x_ql[0..15]: qs (64 bytes), tile_x_ql[16..23]: signs (32 bytes).
+// tile_x_qh: qh (8 bytes). tile_x_sc: scales (4 bytes). tile_x_dm: d.
+// Grid lookup (iq3xs_grid[512]) in vec_dot.
+
+#define QR_IQ3_S_MMQ 2
+#define QI_IQ3_S_MMQ (QK_K / (4 * QR_IQ3_S_MMQ))
+#define VDR_IQ3_S_Q8_1_MMQ 4
+
+template <int mmq_y>
+static __device__ __forceinline__ void allocate_tiles_iq3_s(int** x_ql, half2** x_dm, int** x_qh, int** x_sc) {
+  __shared__ int tile_x_ql[mmq_y * (WARP_SIZE_GGUF) + mmq_y];
+  __shared__ float tile_x_d[mmq_y * (WARP_SIZE_GGUF / QI_IQ3_S_MMQ) + mmq_y / QI_IQ3_S_MMQ];
+  __shared__ int tile_x_qh[mmq_y * (WARP_SIZE_GGUF / 4) + mmq_y / 4];
+  __shared__ int tile_x_sc[mmq_y * (WARP_SIZE_GGUF / 8) + mmq_y / 8];
+
+  *x_ql = tile_x_ql;
+  *x_dm = (half2*)tile_x_d;
+  *x_qh = tile_x_qh;
+  *x_sc = tile_x_sc;
+}
+
+template <int mmq_y, int nwarps, bool need_check>
+static __device__ __forceinline__ void load_tiles_iq3_s(
+    const void* __restrict__ vx,
+    int* __restrict__ x_ql,
+    half2* __restrict__ x_dm,
+    int* __restrict__ x_qh,
+    int* __restrict__ x_sc,
+    const int& i_offset,
+    const int& i_max,
+    const int& k,
+    const int& blocks_per_row) {
+  const int kbx = k / QI_IQ3_S_MMQ;   // 0 (1 block per warp)
+  const int kqsx = k % QI_IQ3_S_MMQ;  // 0..31
+
+  const block_iq3_s* bx0 = (const block_iq3_s*)vx;
+  float* x_dmf = (float*)x_dm;
+
+  // Load qs (64 bytes = 16 int32, slots 0..15) and signs (32 bytes = 8 int32, slots 16..23)
+#pragma unroll
+  for (int i0 = 0; i0 < mmq_y; i0 += nwarps) {
+    int i = i0 + i_offset;
+    if (need_check) {
+      i = min(i, i_max);
+    }
+    const block_iq3_s* bxi = bx0 + i * blocks_per_row + kbx;
+    if (kqsx < 16) {
+      x_ql[i * (WARP_SIZE_GGUF + 1) + k] = get_int_from_uint8(bxi->qs, kqsx);
+    } else if (kqsx < 24) {
+      x_ql[i * (WARP_SIZE_GGUF + 1) + k] = get_int_from_uint8(bxi->signs, kqsx - 16);
+    } else {
+      x_ql[i * (WARP_SIZE_GGUF + 1) + k] = 0;
+    }
+  }
+
+  // Load d scale
+  const int blocks_per_tile_x_row = WARP_SIZE_GGUF / QI_IQ3_S_MMQ;
+  const int kbxd = k % blocks_per_tile_x_row;
+
+#pragma unroll
+  for (int i0 = 0; i0 < mmq_y; i0 += nwarps * QI_IQ3_S_MMQ) {
+    int i = (i0 + i_offset * QI_IQ3_S_MMQ + k / blocks_per_tile_x_row) % mmq_y;
+    if (need_check) {
+      i = min(i, i_max);
+    }
+    const block_iq3_s* bxi = bx0 + i * blocks_per_row + kbxd;
+    x_dmf[i * (WARP_SIZE_GGUF / QI_IQ3_S_MMQ) + i / QI_IQ3_S_MMQ + kbxd] = __half2float(bxi->d);
+  }
+
+  // Load qh (8 bytes = 2 int32)
+#pragma unroll
+  for (int i0 = 0; i0 < mmq_y; i0 += nwarps * 4) {
+    int i = (i0 + i_offset * 4 + k / (WARP_SIZE_GGUF / 4)) % mmq_y;
+    if (need_check) {
+      i = min(i, i_max);
+    }
+    const int kqh = k % (WARP_SIZE_GGUF / 4);
+    if (kqh < 2) {
+      const block_iq3_s* bxi = bx0 + i * blocks_per_row + kbx;
+      x_qh[i * (WARP_SIZE_GGUF / 4) + i / 4 + kqh] = get_int_from_uint8(bxi->qh, kqh);
+    }
+  }
+
+  // Load scales (4 bytes = 1 int32)
+#pragma unroll
+  for (int i0 = 0; i0 < mmq_y; i0 += nwarps * 8) {
+    int i = (i0 + i_offset * 8 + k / (WARP_SIZE_GGUF / 8)) % mmq_y;
+    if (need_check) {
+      i = min(i, i_max);
+    }
+    const int ksc = k % (WARP_SIZE_GGUF / 8);
+    if (ksc < 1) {
+      const block_iq3_s* bxi = bx0 + i * blocks_per_row + kbx;
+      x_sc[i * (WARP_SIZE_GGUF / 8) + i / 8 + ksc] = get_int_from_uint8(bxi->scales, ksc);
+    }
+  }
+}
+
+static __device__ __forceinline__ float vec_dot_iq3_s_q8_1_mul_mat(
+    const int* __restrict__ x_ql,
+    const half2* __restrict__ x_dm,
+    const int* __restrict__ x_qh,
+    const int* __restrict__ x_sc,
+    const int* __restrict__ y_qs,
+    const half2* __restrict__ y_ds,
+    const int& i,
+    const int& j,
+    const int& k) {
+  const float* x_dmf = (const float*)x_dm;
+  const int ib32 = k / 4;  // sub-block index (same for all VDR iterations since k is multiple of 4)
+
+  // Read qs base for this ib32 (8 bytes of grid indices)
+  const uint8_t* qs = (const uint8_t*)&x_ql[i * (WARP_SIZE_GGUF + 1) + ib32 * 2];
+  // Read qh byte for this ib32
+  const uint8_t* qh_all = (const uint8_t*)&x_qh[i * (WARP_SIZE_GGUF / 4) + i / 4];
+  const uint8_t qh_val = qh_all[ib32];
+  // Signs base
+  const uint8_t* all_signs = (const uint8_t*)&x_ql[i * (WARP_SIZE_GGUF + 1) + 16];
+  // Per-sub-block scale
+  const uint8_t* sc_bytes = (const uint8_t*)&x_sc[i * (WARP_SIZE_GGUF / 8) + i / 8];
+  const float sub_scale = 0.5f + ((sc_bytes[ib32 / 2] >> (4 * (ib32 % 2))) & 0xf);
+
+  int sumi = 0;
+#pragma unroll
+  for (int l = 0; l < VDR_IQ3_S_Q8_1_MMQ; ++l) {
+    const int sub = l;  // k%4=0 always, so (k+l)%4 = l
+
+    // Grid lookup: 9-bit index
+    const int grid1_val = iq3xs_grid[qs[2 * sub + 0] | ((qh_val << (8 - 2 * sub)) & 256)];
+    const int grid2_val = iq3xs_grid[qs[2 * sub + 1] | ((qh_val << (7 - 2 * sub)) & 256)];
+
+    // Sign extraction
+    const uint8_t sign_byte = all_signs[4 * ib32 + sub];
+    const uint32_t signs0 = __vcmpeq4(((sign_byte & 0xf) * 0x01010101) & 0x08040201, 0x08040201);
+    const uint32_t signs1 = __vcmpeq4(((sign_byte >> 4) * 0x01010101) & 0x08040201, 0x08040201);
+    const int grid_l = __vsub4(grid1_val ^ signs0, signs0);
+    const int grid_h = __vsub4(grid2_val ^ signs1, signs1);
+
+    const int index_y = j * WARP_SIZE_GGUF + (QR_IQ3_S_MMQ * (k + l)) % WARP_SIZE_GGUF;
+    sumi = __dp4a(grid_l, y_qs[index_y + 0], sumi);
+    sumi = __dp4a(grid_h, y_qs[index_y + 1], sumi);
+  }
+
+  const float2 ds8 =
+      __half22float2(y_ds[j * (WARP_SIZE_GGUF / QI8_1) + (QR_IQ3_S_MMQ * k / QI8_1) % (WARP_SIZE_GGUF / QI8_1)]);
+
+  return x_dmf[i * (WARP_SIZE_GGUF / QI_IQ3_S_MMQ) + i / QI_IQ3_S_MMQ] * sub_scale * 0.5f * ds8.x * sumi;
+}
+
+// ========================= IQ3_XXS MMQ =========================
+// IQ3_XXS: QK_K=256, qs[3*(QK_K/8)=96 bytes]: first 64 = grid indices, last 32 = gas (signs+scales).
+// Grid: iq3xxs_grid[256] (uint32). Sign via ksigns64. Scale from gas aux bits.
+// Same custom QR=2, QI=32 approach.
+
+#define QR_IQ3_XXS_MMQ 2
+#define QI_IQ3_XXS_MMQ (QK_K / (4 * QR_IQ3_XXS_MMQ))
+#define VDR_IQ3_XXS_Q8_1_MMQ 4
+
+template <int mmq_y>
+static __device__ __forceinline__ void allocate_tiles_iq3_xxs(int** x_ql, half2** x_dm, int** x_qh, int** x_sc) {
+  // tile_x_ql: slots 0..15 = grid indices (64 bytes), slots 16..23 = gas data (32 bytes)
+  __shared__ int tile_x_ql[mmq_y * (WARP_SIZE_GGUF) + mmq_y];
+  __shared__ float tile_x_d[mmq_y * (WARP_SIZE_GGUF / QI_IQ3_XXS_MMQ) + mmq_y / QI_IQ3_XXS_MMQ];
+
+  *x_ql = tile_x_ql;
+  *x_dm = (half2*)tile_x_d;
+}
+
+template <int mmq_y, int nwarps, bool need_check>
+static __device__ __forceinline__ void load_tiles_iq3_xxs(
+    const void* __restrict__ vx,
+    int* __restrict__ x_ql,
+    half2* __restrict__ x_dm,
+    int* __restrict__ x_qh,
+    int* __restrict__ x_sc,
+    const int& i_offset,
+    const int& i_max,
+    const int& k,
+    const int& blocks_per_row) {
+  (void)x_qh;
+  (void)x_sc;
+
+  const int kbx = k / QI_IQ3_XXS_MMQ;
+  const int kqsx = k % QI_IQ3_XXS_MMQ;
+
+  const block_iq3_xxs* bx0 = (const block_iq3_xxs*)vx;
+  float* x_dmf = (float*)x_dm;
+
+  // Load grid indices (64 bytes, slots 0..15) and gas data (32 bytes, slots 16..23)
+#pragma unroll
+  for (int i0 = 0; i0 < mmq_y; i0 += nwarps) {
+    int i = i0 + i_offset;
+    if (need_check) {
+      i = min(i, i_max);
+    }
+    const block_iq3_xxs* bxi = bx0 + i * blocks_per_row + kbx;
+    if (kqsx < 16) {
+      // Grid indices: first 64 bytes of qs
+      x_ql[i * (WARP_SIZE_GGUF + 1) + k] = get_int_from_uint8(bxi->qs, kqsx);
+    } else if (kqsx < 24) {
+      // Gas data (signs+scales): bytes 64..95 of qs
+      x_ql[i * (WARP_SIZE_GGUF + 1) + k] = get_int_from_uint8(bxi->qs + QK_K / 4, kqsx - 16);
+    } else {
+      x_ql[i * (WARP_SIZE_GGUF + 1) + k] = 0;
+    }
+  }
+
+  // Load d scale
+  const int blocks_per_tile_x_row = WARP_SIZE_GGUF / QI_IQ3_XXS_MMQ;
+  const int kbxd = k % blocks_per_tile_x_row;
+
+#pragma unroll
+  for (int i0 = 0; i0 < mmq_y; i0 += nwarps * QI_IQ3_XXS_MMQ) {
+    int i = (i0 + i_offset * QI_IQ3_XXS_MMQ + k / blocks_per_tile_x_row) % mmq_y;
+    if (need_check) {
+      i = min(i, i_max);
+    }
+    const block_iq3_xxs* bxi = bx0 + i * blocks_per_row + kbxd;
+    x_dmf[i * (WARP_SIZE_GGUF / QI_IQ3_XXS_MMQ) + i / QI_IQ3_XXS_MMQ + kbxd] = __half2float(bxi->d);
+  }
+}
+
+static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1_mul_mat(
+    const int* __restrict__ x_ql,
+    const half2* __restrict__ x_dm,
+    const int* __restrict__ x_qh,
+    const int* __restrict__ x_sc,
+    const int* __restrict__ y_qs,
+    const half2* __restrict__ y_ds,
+    const int& i,
+    const int& j,
+    const int& k) {
+  (void)x_qh;
+  (void)x_sc;
+
+  const float* x_dmf = (const float*)x_dm;
+
+  const int ib32 = k / 4;
+
+  // Grid indices for this ib32
+  const uint8_t* q3 = (const uint8_t*)&x_ql[i * (WARP_SIZE_GGUF + 1) + ib32 * 2];
+
+  // Gas data for this ib32 (signs + scale packed in 4 bytes per ib32)
+  const uint16_t* gas = (const uint16_t*)&x_ql[i * (WARP_SIZE_GGUF + 1) + 16 + ib32];
+  uint32_t aux32 = gas[0] | (gas[1] << 16);
+  const float sub_scale = 0.5f + (aux32 >> 28);
+
+  int sumi = 0;
+#pragma unroll
+  for (int l = 0; l < VDR_IQ3_XXS_Q8_1_MMQ; ++l) {
+    const int sub = l;
+
+    // Extract signs for this sub-group
+    uint32_t signs_val = aux32 >> (7 * sub);
+    const uint32_t* signs = (const uint32_t*)(ksigns64 + (signs_val & 127));
+
+    // Grid lookup
+    const uint32_t* grid1 = iq3xxs_grid + q3[2 * sub + 0];
+    const uint32_t* grid2 = iq3xxs_grid + q3[2 * sub + 1];
+
+    // Apply signs
+    const int grid_l = __vsub4(grid1[0] ^ signs[0], signs[0]);
+    const int grid_h = __vsub4(grid2[0] ^ signs[1], signs[1]);
+
+    // Q8 data
+    const int index_y = j * WARP_SIZE_GGUF + (QR_IQ3_XXS_MMQ * (k + l)) % WARP_SIZE_GGUF;
+    sumi = __dp4a(grid_l, y_qs[index_y + 0], sumi);
+    sumi = __dp4a(grid_h, y_qs[index_y + 1], sumi);
+  }
+
+  const float2 ds8 =
+      __half22float2(y_ds[j * (WARP_SIZE_GGUF / QI8_1) + (QR_IQ3_XXS_MMQ * k / QI8_1) % (WARP_SIZE_GGUF / QI8_1)]);
+
+  return x_dmf[i * (WARP_SIZE_GGUF / QI_IQ3_XXS_MMQ) + i / QI_IQ3_XXS_MMQ] * sub_scale * 0.5f * ds8.x * sumi;
+}
+
+// ========================= IQ2_XS MMQ =========================
+// IQ2_XS: QK_K=256, qs[QK_K/8=32 uint16], scales[QK_K/32=8 uint8]. Grid: iq2xs_grid[512] (uint64).
+// Per ib32: 4 uint16 from qs. Each uint16: low 9 bits = grid index, upper 7 = signs.
+
+#define QR_IQ2_XS_MMQ 2
+#define QI_IQ2_XS_MMQ (QK_K / (4 * QR_IQ2_XS_MMQ))
+#define VDR_IQ2_XS_Q8_1_MMQ 4
+
+template <int mmq_y>
+static __device__ __forceinline__ void allocate_tiles_iq2_xs(int** x_ql, half2** x_dm, int** x_qh, int** x_sc) {
+  __shared__ int tile_x_ql[mmq_y * (WARP_SIZE_GGUF) + mmq_y];
+  __shared__ float tile_x_d[mmq_y * (WARP_SIZE_GGUF / QI_IQ2_XS_MMQ) + mmq_y / QI_IQ2_XS_MMQ];
+  __shared__ int tile_x_sc[mmq_y * (WARP_SIZE_GGUF / 8) + mmq_y / 8];
+
+  *x_ql = tile_x_ql;
+  *x_dm = (half2*)tile_x_d;
+  *x_sc = tile_x_sc;
+}
+
+template <int mmq_y, int nwarps, bool need_check>
+static __device__ __forceinline__ void load_tiles_iq2_xs(
+    const void* __restrict__ vx,
+    int* __restrict__ x_ql,
+    half2* __restrict__ x_dm,
+    int* __restrict__ x_qh,
+    int* __restrict__ x_sc,
+    const int& i_offset,
+    const int& i_max,
+    const int& k,
+    const int& blocks_per_row) {
+  (void)x_qh;
+
+  const int kbx = k / QI_IQ2_XS_MMQ;
+  const int kqsx = k % QI_IQ2_XS_MMQ;
+
+  const block_iq2_xs* bx0 = (const block_iq2_xs*)vx;
+  float* x_dmf = (float*)x_dm;
+
+  // Load qs data (32 uint16 = 64 bytes = 16 int32)
+#pragma unroll
+  for (int i0 = 0; i0 < mmq_y; i0 += nwarps) {
+    int i = i0 + i_offset;
+    if (need_check) {
+      i = min(i, i_max);
+    }
+    const block_iq2_xs* bxi = bx0 + i * blocks_per_row + kbx;
+    if (kqsx < 16) {
+      x_ql[i * (WARP_SIZE_GGUF + 1) + k] = get_int_b2(bxi->qs, kqsx);
+    } else {
+      x_ql[i * (WARP_SIZE_GGUF + 1) + k] = 0;
+    }
+  }
+
+  // Load d scale
+  const int blocks_per_tile_x_row = WARP_SIZE_GGUF / QI_IQ2_XS_MMQ;
+  const int kbxd = k % blocks_per_tile_x_row;
+
+#pragma unroll
+  for (int i0 = 0; i0 < mmq_y; i0 += nwarps * QI_IQ2_XS_MMQ) {
+    int i = (i0 + i_offset * QI_IQ2_XS_MMQ + k / blocks_per_tile_x_row) % mmq_y;
+    if (need_check) {
+      i = min(i, i_max);
+    }
+    const block_iq2_xs* bxi = bx0 + i * blocks_per_row + kbxd;
+    x_dmf[i * (WARP_SIZE_GGUF / QI_IQ2_XS_MMQ) + i / QI_IQ2_XS_MMQ + kbxd] = __half2float(bxi->d);
+  }
+
+  // Load scales (8 bytes = 2 int32)
+#pragma unroll
+  for (int i0 = 0; i0 < mmq_y; i0 += nwarps * 8) {
+    int i = (i0 + i_offset * 8 + k / (WARP_SIZE_GGUF / 8)) % mmq_y;
+    if (need_check) {
+      i = min(i, i_max);
+    }
+    const int ksc = k % (WARP_SIZE_GGUF / 8);
+    if (ksc < 2) {
+      const block_iq2_xs* bxi = bx0 + i * blocks_per_row + kbx;
+      x_sc[i * (WARP_SIZE_GGUF / 8) + i / 8 + ksc] = get_int_from_uint8(bxi->scales, ksc);
+    }
+  }
+}
+
+static __device__ __forceinline__ float vec_dot_iq2_xs_q8_1_mul_mat(
+    const int* __restrict__ x_ql,
+    const half2* __restrict__ x_dm,
+    const int* __restrict__ x_qh,
+    const int* __restrict__ x_sc,
+    const int* __restrict__ y_qs,
+    const half2* __restrict__ y_ds,
+    const int& i,
+    const int& j,
+    const int& k) {
+  (void)x_qh;
+
+  const float* x_dmf = (const float*)x_dm;
+
+  const int ib32 = k / 4;
+
+  // Read the 4 uint16 for this ib32
+  const uint16_t* q2 = (const uint16_t*)&x_ql[i * (WARP_SIZE_GGUF + 1) + ib32 * 2];
+
+  // Per-sub-block scales
+  const uint8_t* sc_bytes = (const uint8_t*)&x_sc[i * (WARP_SIZE_GGUF / 8) + i / 8];
+
+  float sumf = 0;
+#pragma unroll
+  for (int l = 0; l < VDR_IQ2_XS_Q8_1_MMQ; ++l) {
+    const int sub = l;
+
+    // Grid lookup: 9-bit index, 7-bit signs
+    const uint8_t* grid = (const uint8_t*)(iq2xs_grid + (q2[sub] & 511));
+    const uint8_t signs = ksigns_iq2xs[q2[sub] >> 9];
+
+    const int index_y = j * WARP_SIZE_GGUF + (QR_IQ2_XS_MMQ * (k + l)) % WARP_SIZE_GGUF;
+    const int8_t* q8 = (const int8_t*)&y_qs[index_y];
+
+    int sumi = 0;
+    for (int jj = 0; jj < 8; ++jj) {
+      sumi += q8[jj] * grid[jj] * (signs & kmask_iq2xs[jj] ? -1 : 1);
+    }
+
+    const uint8_t ls = (sub < 2) ? (sc_bytes[ib32] & 0xf) : (sc_bytes[ib32] >> 4);
+    sumf += (0.5f + ls) * sumi;
+  }
+
+  const float2 ds8 =
+      __half22float2(y_ds[j * (WARP_SIZE_GGUF / QI8_1) + (QR_IQ2_XS_MMQ * k / QI8_1) % (WARP_SIZE_GGUF / QI8_1)]);
+
+  return x_dmf[i * (WARP_SIZE_GGUF / QI_IQ2_XS_MMQ) + i / QI_IQ2_XS_MMQ] * 0.25f * ds8.x * sumf;
+}

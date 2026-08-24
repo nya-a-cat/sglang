@@ -161,12 +161,21 @@ IMATRIX_QUANT_TYPES = {
     WeightType.IQ4_XS,
     WeightType.IQ4_NL,
 }
-# TODO(Isotr0py): Currently, we don't have MMQ kernel for I-Matrix quantization.
-# Consolidate DEQUANT_TYPES, MMVQ_QUANT_TYPES and MMQ_QUANT_TYPES after we add
-# MMQ kernel for I-Matrix quantization.
+# These formats cover the I-quant routed-expert weights used by the profiled
+# DeepSeek-V4 GGUF checkpoint. Other I-quant formats keep the existing MMVQ and
+# dequantize-plus-matmul fallbacks until they have their own validated MMQ kernel.
+IQUANT_MMQ_QUANT_TYPES = (
+    {
+        WeightType.IQ2_XS,
+        WeightType.IQ3_XXS,
+        WeightType.IQ3_S,
+    }
+    if _is_cuda
+    else set()
+)
 DEQUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
 MMVQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
-MMQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES
+MMQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IQUANT_MMQ_QUANT_TYPES
 
 
 def dequantize_gguf_weight(
@@ -195,7 +204,8 @@ def fused_mul_mat_gguf(
     # enable MMVQ in contiguous batching with batch_size=1
     if x.shape[0] <= mmvq_safe and qweight_type in MMVQ_QUANT_TYPES:
         y = ggml_mul_mat_vec_a8(qweight, x, qweight_type, qweight.shape[0])
-    # Use MMQ Kernel if it's available (standard + k-quants)
+    # Use MMQ when a fused kernel is available (standard, K-quant, and
+    # explicitly validated I-quant formats).
     elif qweight_type in MMQ_QUANT_TYPES:
         y = ggml_mul_mat_a8(qweight, x, qweight_type, qweight.shape[0])
     # If there is no available MMQ kernel, fallback to dequantize
